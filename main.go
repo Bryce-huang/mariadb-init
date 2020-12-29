@@ -2,14 +2,16 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
-	"github.com/gin-gonic/gin"
 	"io"
-	"io/ioutil"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -19,39 +21,143 @@ import (
 
 var PodName = os.Getenv("MY_POD_NAME")
 var REPLICAS = os.Getenv("REPLICAS")
-var MariadbGaleraClusterAddress = os.Getenv("MARIADB_GALERA_CLUSTER_ADDRESS")
+var MariadbGaleraClusterAddress = os.Getenv("MARIADB_ADDRESS")
 var signal = make(chan int)
+var namespace = os.Getenv("NS")
 
 const (
-	GrastatePath = "/bitnami/mariadb/data/grastate.dat"
-	MysqlPort    = "3306"
-	InitPort     = 3307
+	GrastatePath  = "/bitnami/mariadb/data/grastate.dat"
+	MysqlPort     = "3306"
+	ConfigMapName = "init-mariadb-config"
 )
 
 func main() {
-	go runHttp()
-	go initToWait()
 
-	// 如果文件存在则需要确保所有节点都正常通信过一次
-	os.Exit(<-signal)
+	go initToWait()
+	<-signal
+	log.Println("初始化退出。。。")
+}
+
+var K8sConfig *rest.Config
+var client *kubernetes.Clientset
+
+func init() {
+	var err error
+	if K8sConfig, err = rest.InClusterConfig(); err != nil {
+		K8sConfig, err = clientcmd.BuildConfigFromFlags("", "./config")
+		if err != nil {
+			log.Println("Get k8sConfig fail: ", err)
+			panic(err)
+		}
+
+	}
+	client, err = kubernetes.NewForConfig(K8sConfig)
+	if err != nil {
+		log.Println("Get k8sClient fail: ", err)
+		panic(err)
+	}
+
+}
+
+func statusReportAndGetAllStatus(node string, num string) []SeqNum {
+
+	cmApi := client.CoreV1().ConfigMaps(namespace)
+	// 第一次删除所有状态
+
+	configMap, err := cmApi.Get(ConfigMapName, metav1.GetOptions{})
+
+	if errors.IsNotFound(err) {
+		fmt.Printf("Pod %s in namespace %s not found\n", "init-mariadb-config", namespace)
+
+		r := &v1.ConfigMap{}
+		r.Kind = "ConfigMap"
+		r.APIVersion = "v1"
+		r.Name = "init-mariadb-config"
+		r.Labels = map[string]string{"int": "mariadb-galera", "app": "mariadb-galera"}
+		r.Data = nil
+		configMap, err = cmApi.Create(r)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	fmt.Printf("origin: %v \n", configMap.Data)
+	configMap.Data = map[string]string{
+		node: num,
+	}
+	configMap, err = cmApi.Update(configMap)
+
+	for err != nil {
+		configMap, err = cmApi.Update(configMap)
+		time.Sleep(time.Second*2)
+	}
+	half, _ := strconv.Atoi(REPLICAS)
+	// 不能以半数启动
+	//half = half/2 + 1
+	count := 0
+
+	for {
+		//if checkClusterExits() {
+		//	log.Print("集群已存在，可以启动")
+		//	signal <- 0
+		//	return nil
+		//
+		//}
+		configMap, err := cmApi.Get(ConfigMapName, metav1.GetOptions{})
+		if err != nil {
+			log.Fatal("can't get the cm:", err)
+		}
+
+		if v, ok := configMap.Data[node]; !ok || v != num {
+			configMap.Data[node] = num
+			configMap, _ = cmApi.Update(configMap)
+			log.Printf("configmap不存在数据，更新%v \n", v)
+		}
+
+		log.Printf("检查configMap：%d次，%v \n", count, configMap.Data)
+		maps := configMap.Data
+
+		log.Printf("map size is %d,half is %d \n", len(maps), half)
+		if len(maps) == half {
+			var res []SeqNum
+			for s := range maps {
+				node, _ := strconv.Atoi(s)
+				num, _ := strconv.Atoi(maps[s])
+				res = append(res, SeqNum{node, num})
+			}
+			log.Printf("发现seqnum slice： %v", res)
+			return res
+		}
+		count++
+		if count > 49 {
+			os.Exit(1)
+		}
+		time.Sleep(time.Second * 3)
+	}
+
+	return nil
 }
 
 func initToWait() {
+
 	//  检查是否存在 grastate文件
 	// 不存在 .检查本pod是不是id 为0，直接启动，不是的话 检查上一个node节点是否活跃，否则等待。直到上一个节点活跃
 	file, err := os.Open(GrastatePath)
 	if os.IsNotExist(err) {
-		fmt.Println("文件不存在,按照顺序启动。。。")
+		log.Println("文件不存在,按照顺序启动。。。")
 		if isFirst() {
 			signal <- 0
 			return
 		} else {
+			count := 0
 			for {
+				count++
+				log.Println("已重试", count, "次")
 				if preNodeReady(getPodNum() - 1) {
 					signal <- 0
 					return
 				}
-				time.Sleep(time.Second * 10)
+				time.Sleep(time.Second * 5)
 			}
 		}
 	}
@@ -62,16 +168,16 @@ func initToWait() {
 
 	// 存在
 	// 判断集群是否存在  存在集群，直接启动本机
-	for i := 0; i < 3; i++ {
-		if isOpen(MariadbGaleraClusterAddress, MysqlPort) {
-			signal <- 0
-			return
-		}
+	if checkClusterExits() {
+		signal <- 0
+		return
 	}
 
 	// 获取所有seqnum，确保所有节点都至少通信过一次，检查是否所有的都是一样的seqnum，
 
-	seqNums := getAllSeqNum()
+	seqNums := statusReportAndGetAllStatus(strconv.Itoa(getPodNum()), strconv.Itoa(getNum()))
+
+
 
 	// 一样，按照顺序启动
 	if isAllSeqNoEqual(seqNums) {
@@ -84,7 +190,7 @@ func initToWait() {
 					signal <- 0
 					return
 				}
-				time.Sleep(time.Second * 10)
+				time.Sleep(time.Second * 5)
 			}
 		}
 	}
@@ -98,6 +204,7 @@ func initToWait() {
 		signal <- 0
 		return
 	}
+
 	pre := getPreNum(seqNums)
 	if pre == -1 {
 		log.Printf("fail to judge，the slice is %v", seqNums)
@@ -106,26 +213,36 @@ func initToWait() {
 	}
 
 	for {
-		if preNodeReady(getPodNum() - 1) {
+		if preNodeReady(pre) {
 			signal <- 0
 			return
 		}
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Second * 5)
 	}
 }
 
-func meIsMax(seqNums []SeqNum) bool {
-	if seqNums[0].node == getPodNum() {
-		return true
+func checkClusterExits() bool {
+	log.Println("文件已存在，检查集群是否存在")
+	for i := 0; i < 3; i++ {
+		if isOpen(MariadbGaleraClusterAddress, MysqlPort) {
+			signal <- 0
+			return true
+		}
 	}
+	log.Println("集群不存在。。。")
 	return false
+}
+
+func meIsMax(seqNums []SeqNum) bool {
+	return seqNums[0].node == getPodNum()
+
 }
 
 func getPreNum(seqNums []SeqNum) int {
 	node := getPodNum()
 	for i, v := range seqNums {
 		if v.node == node {
-			return i - 1
+			return seqNums[i-1].node
 		}
 	}
 	return -1
@@ -147,59 +264,73 @@ type SeqNum struct {
 	num  int
 }
 
-func getAllSeqNum() []SeqNum {
-	replicas, err := strconv.Atoi(REPLICAS)
-	if err != nil {
-		panic(err)
-	}
-	prefix := getPodPrefix()
-	seqNums := make([]SeqNum, replicas)
-	for i := 0; i < replicas; i++ {
-		index := strconv.Itoa(i)
-		url := prefix + index + ":3307/seq-num?id=" + strconv.Itoa(getPodNum())
-		resp, err := http.Get(url)
-		if err != nil {
-			panic(err)
-		}
-		defer resp.Body.Close()
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			panic(err)
-		}
-		var result Resp
-		_ = json.Unmarshal(body, &result)
-		seqNums = append(seqNums, SeqNum{i, result.Data})
-	}
-
-	return seqNums
-
-}
-
-func runHttp() {
-	router := gin.Default()
-	router.GET("/seq-num", GetSeqNum)
-	_ = router.Run(":3307")
-}
+//func getAllSeqNum() []SeqNum {
+//	replicas, err := strconv.Atoi(REPLICAS)
+//	if err != nil {
+//		panic(err)
+//	}
+//	prefix := getPodPrefix()
+//	seqNums := make([]SeqNum, replicas)
+//	for i := 0; i < replicas; i++ {
+//		index := strconv.Itoa(i)
+//		url := "http://" + prefix + "-" + index + "." + MariadbGaleraClusterAddress + ":3307/seq-num"
+//		resp, err := http.Get(url)
+//		if err != nil {
+//			log.Println("获取地址：", url, " 失败", err)
+//			for i := 0; i < 3; i++ {
+//				log.Println("重新尝试连:", url)
+//				time.Sleep(10 * time.Second)
+//				resp, err = http.Get(url)
+//				if err == nil {
+//					break
+//				}
+//			}
+//			if err != nil {
+//				panic(err)
+//			}
+//		}
+//		log.Println("链接成功：", url)
+//
+//		body, err := ioutil.ReadAll(resp.Body)
+//		if err != nil {
+//			panic(err)
+//		}
+//		var result Resp
+//		_ = json.Unmarshal(body, &result)
+//		seqNums = append(seqNums, SeqNum{i, result.Data})
+//		_ = resp.Body.Close()
+//	}
+//
+//	return seqNums
+//
+//}
 
 func preNodeReady(pre int) bool {
-	if isFirst() {
-		return true
-	}
-	host := getPodPrefix() + strconv.Itoa(pre)
+
+	host := getPodPrefix() + "-" + strconv.Itoa(pre) + "." + MariadbGaleraClusterAddress
+	//_, err := net.LookupHost(host)
+	//if err != nil {
+	//	_, _ = fmt.Fprintf(os.Stderr, "Err: %s", err.Error())
+	//	return false
+	//}
 	return isOpen(host, MysqlPort)
 }
 
 func isOpen(host string, port string) bool {
-
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 2*time.Second)
+	url := net.JoinHostPort(host, port)
+	log.Println("尝试连接地址：", url)
+	conn, err := net.DialTimeout("tcp", url, 2*time.Second)
 	if err != nil {
+		log.Printf("链接失败: %s:%s\n", host, port)
 		return false
 	}
+	defer conn.Close()
 	if conn != nil {
-		defer conn.Close()
+		log.Printf("链接成功: %s:%s\n", host, port)
 		return true
 	}
+	log.Printf("链接失败: %s:%s\n", host, port)
+
 	return false
 }
 
@@ -208,42 +339,6 @@ func isFirst() bool {
 		return true
 	}
 	return false
-}
-func GetSeqNum(context *gin.Context) {
-	//dat, err := os.Open("/bitnami/mariadb/data/grastate.dat")
-	dat, err := os.Open("./grastate.dat")
-	if err != nil {
-		context.JSON(500, nil)
-	}
-	defer dat.Close()
-	br := bufio.NewReader(dat)
-	line := 0
-	for {
-		s, _, c := br.ReadLine()
-
-		line++
-		if c == io.EOF {
-			break
-		}
-		if c != nil {
-			fmt.Println("出错:", c)
-			break
-		}
-		if line != 4 {
-			continue
-		}
-		str := string(s)
-		num, err := strconv.Atoi(strings.TrimSpace(str[strings.IndexByte(str, ':')+1:]))
-		if err != nil {
-			context.JSON(500, nil)
-		}
-		context.JSON(200,
-			Resp{"ok", num, 200})
-		return
-
-	}
-	context.JSON(500, nil)
-
 }
 
 type Resp struct {
@@ -258,10 +353,42 @@ func getPodPrefix() (name string) {
 }
 
 func getPodNum() int {
-
 	num, err := strconv.Atoi(PodName[strings.LastIndex(PodName, "-")+1:])
 	if err != nil {
 		panic(nil)
 	}
 	return num
+}
+func getNum() int {
+
+	file, err := os.Open(GrastatePath)
+	//file, err := os.Open("./grastate.dat")
+	if os.IsNotExist(err) {
+		return -1
+	}
+	defer file.Close()
+	br := bufio.NewReader(file)
+	line := 0
+	for {
+		s, _, c := br.ReadLine()
+
+		line++
+		if c == io.EOF {
+			break
+		}
+		if c != nil {
+			log.Println("出错:", c)
+			break
+		}
+		if line != 4 {
+			continue
+		}
+		str := string(s)
+		num, err := strconv.Atoi(strings.TrimSpace(str[strings.IndexByte(str, ':')+1:]))
+		if err != nil {
+			panic(err)
+		}
+		return num
+	}
+	return -1
 }
