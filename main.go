@@ -24,6 +24,7 @@ var REPLICAS = os.Getenv("REPLICAS")
 var MariadbGaleraClusterAddress = os.Getenv("MARIADB_ADDRESS")
 var signal = make(chan int)
 var namespace = os.Getenv("NS")
+var ClusterAddress = "mariadb-galera.default.svc.cluster.local"
 
 const (
 	GrastatePath  = "/bitnami/mariadb/data/grastate.dat"
@@ -88,8 +89,9 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 	configMap, err = cmApi.Update(configMap)
 
 	for err != nil {
+		log.Println("configmap update failed, after 2 second retry")
+		time.Sleep(time.Second * 2)
 		configMap, err = cmApi.Update(configMap)
-		time.Sleep(time.Second*2)
 	}
 	half, _ := strconv.Atoi(REPLICAS)
 	// 不能以半数启动
@@ -97,15 +99,17 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 	count := 0
 
 	for {
-		//if checkClusterExits() {
-		//	log.Print("集群已存在，可以启动")
-		//	signal <- 0
-		//	return nil
-		//
-		//}
+		if checkClusterExits() {
+			log.Print("集群已存在，可以启动")
+			signal <- 0
+			time.Sleep(time.Hour)
+			return nil
+
+		}
 		configMap, err := cmApi.Get(ConfigMapName, metav1.GetOptions{})
 		if err != nil {
-			log.Fatal("can't get the cm:", err)
+			log.Println("waiting pod killed  by k8s ... ")
+			time.Sleep(time.Hour)
 		}
 
 		if v, ok := configMap.Data[node]; !ok || v != num {
@@ -177,8 +181,6 @@ func initToWait() {
 
 	seqNums := statusReportAndGetAllStatus(strconv.Itoa(getPodNum()), strconv.Itoa(getNum()))
 
-
-
 	// 一样，按照顺序启动
 	if isAllSeqNoEqual(seqNums) {
 		if isFirst() {
@@ -222,9 +224,9 @@ func initToWait() {
 }
 
 func checkClusterExits() bool {
-	log.Println("文件已存在，检查集群是否存在")
+
 	for i := 0; i < 3; i++ {
-		if isOpen(MariadbGaleraClusterAddress, MysqlPort) {
+		if isOpen(ClusterAddress, MysqlPort) {
 			signal <- 0
 			return true
 		}
@@ -263,47 +265,6 @@ type SeqNum struct {
 	node int
 	num  int
 }
-
-//func getAllSeqNum() []SeqNum {
-//	replicas, err := strconv.Atoi(REPLICAS)
-//	if err != nil {
-//		panic(err)
-//	}
-//	prefix := getPodPrefix()
-//	seqNums := make([]SeqNum, replicas)
-//	for i := 0; i < replicas; i++ {
-//		index := strconv.Itoa(i)
-//		url := "http://" + prefix + "-" + index + "." + MariadbGaleraClusterAddress + ":3307/seq-num"
-//		resp, err := http.Get(url)
-//		if err != nil {
-//			log.Println("获取地址：", url, " 失败", err)
-//			for i := 0; i < 3; i++ {
-//				log.Println("重新尝试连:", url)
-//				time.Sleep(10 * time.Second)
-//				resp, err = http.Get(url)
-//				if err == nil {
-//					break
-//				}
-//			}
-//			if err != nil {
-//				panic(err)
-//			}
-//		}
-//		log.Println("链接成功：", url)
-//
-//		body, err := ioutil.ReadAll(resp.Body)
-//		if err != nil {
-//			panic(err)
-//		}
-//		var result Resp
-//		_ = json.Unmarshal(body, &result)
-//		seqNums = append(seqNums, SeqNum{i, result.Data})
-//		_ = resp.Body.Close()
-//	}
-//
-//	return seqNums
-//
-//}
 
 func preNodeReady(pre int) bool {
 
