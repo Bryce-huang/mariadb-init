@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,10 +34,10 @@ const (
 )
 
 func main() {
-
 	go initToWait()
 	<-signal
 	log.Println("初始化退出。。。")
+
 }
 
 var K8sConfig *rest.Config
@@ -91,6 +92,10 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 	for err != nil {
 		log.Println("configmap update failed, after 2 second retry")
 		time.Sleep(time.Second * 2)
+		configMap, err = cmApi.Get(ConfigMapName, metav1.GetOptions{})
+		configMap.Data = map[string]string{
+			node: num,
+		}
 		configMap, err = cmApi.Update(configMap)
 	}
 	half, _ := strconv.Atoi(REPLICAS)
@@ -121,7 +126,7 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 		log.Printf("检查configMap：%d次，%v \n", count, configMap.Data)
 		maps := configMap.Data
 
-		log.Printf("map size is %d,half is %d \n", len(maps), half)
+		log.Printf("map size is %d,size is %d \n", len(maps), half)
 		if len(maps) == half {
 			var res []SeqNum
 			for s := range maps {
@@ -142,6 +147,50 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 	return nil
 }
 
+func readFile() ([]byte, error) {
+	file, err := os.Open(GrastatePath)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+
+	output := make([]byte, 0)
+	for {
+		line, _, err := reader.ReadLine()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			panic(err)
+		}
+		if ok, _ := regexp.Match("safe_to_bootstrap", line); ok {
+			output = append(output, []byte("safe_to_bootstrap: 1")...)
+			output = append(output, []byte("\n")...)
+		} else {
+			output = append(output, line...)
+			output = append(output, []byte("\n")...)
+		}
+	}
+	return output, err
+}
+
+func setSafeToBootstrap() {
+	output, err := readFile()
+
+	fmt.Println(string(output[:]))
+	f, err := os.OpenFile(GrastatePath, os.O_WRONLY|os.O_TRUNC, 0600)
+	defer f.Close()
+	if err != nil {
+		panic(err)
+	}
+	writer := bufio.NewWriter(f)
+	_, err = writer.Write(output)
+	if err != nil {
+		panic(err)
+	}
+	_ = writer.Flush()
+}
 func initToWait() {
 
 	//  检查是否存在 grastate文件
@@ -166,7 +215,8 @@ func initToWait() {
 		}
 	}
 	if err != nil {
-		panic(err)
+		log.Printf("无法打开文件：%v,等待被kill", err)
+		time.Sleep(time.Hour)
 	}
 	defer file.Close()
 
@@ -176,6 +226,8 @@ func initToWait() {
 		signal <- 0
 		return
 	}
+
+	setSafeToBootstrap()
 
 	// 获取所有seqnum，确保所有节点都至少通信过一次，检查是否所有的都是一样的seqnum，
 
@@ -202,6 +254,7 @@ func initToWait() {
 		return seqNums[i].num > seqNums[j].num
 	})
 
+	log.Println("after sorted slice:", seqNums)
 	if meIsMax(seqNums) {
 		signal <- 0
 		return
@@ -300,12 +353,6 @@ func isFirst() bool {
 		return true
 	}
 	return false
-}
-
-type Resp struct {
-	Msg  string `json:"msg"`
-	Data int    `json:"data"`
-	Code int    `json:"code"`
 }
 
 func getPodPrefix() (name string) {

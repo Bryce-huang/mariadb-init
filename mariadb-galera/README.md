@@ -3,11 +3,11 @@
 ## 部署案例
 
 ```bash
-helm install mariadb-galera mariadb-galera-5.0.1.tgz \
---set node1=kube-master001,node2=kube-master002,node3=kube-master003 \
---set persistence.path=/data/db \
+helm install mariadb-galera ./mariadb-galera \
+--set node1=node1,node2=node2,node3=node3 \
+--set persistence.path=/data/mysql \
 --set resources.limits.cpu=2,resources.limits.memory=4096Mi,resources.requests.memory=4096Mi,resources.requests.cpu=2 \
---set image.registry=docker.io,image.repository=bryce-huang/mariadb-init,image.tag=v1
+--set image.registry=docker.io,image.repository=brycehuang/mariadb-init,image.tag=v1
 
 --set image.registry=docker.io,image.repository=bitnami/mariadb-galera,image.tag=10.5.8-debian-10-r0
 

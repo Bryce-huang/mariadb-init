@@ -1,4 +1,3 @@
-
 FROM brycehuang/debian10:golang-1.15.6 as builder
 #FROM golang:alpine as builder
 RUN mkdir -p /go/src
