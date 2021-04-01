@@ -19,26 +19,18 @@ import (
 	"time"
 )
 
-var PodName = os.Getenv("MY_POD_NAME")
-var REPLICAS = os.Getenv("REPLICAS")
-var MariadbGaleraClusterAddress = os.Getenv("MARIADB_ADDRESS")
-var signal = make(chan int)
-var namespace = os.Getenv("NS")
-var ClusterAddress = "mariadb-galera.default.svc.cluster.local"
-
 const (
 	GrastatePath  = "/bitnami/mariadb/data/grastate.dat"
 	MysqlPort     = "3306"
 	ConfigMapName = "init-mariadb-config"
 )
 
-func main() {
-
-	go initToWait()
-	<-signal
-	log.Println("初始化退出。。。")
-}
-
+var PodName = os.Getenv("MY_POD_NAME")
+var REPLICAS = os.Getenv("REPLICAS")
+var MariadbGaleraClusterAddress = os.Getenv("MARIADB_ADDRESS")
+var signal = make(chan int)
+var namespace = os.Getenv("NS")
+var ClusterAddress = "mariadb-galera.default.svc.cluster.local"
 var K8sConfig *rest.Config
 var client *kubernetes.Clientset
 
@@ -58,6 +50,13 @@ func init() {
 		panic(err)
 	}
 
+}
+
+func main() {
+
+	go task()
+	<-signal
+	log.Println("初始化退出。。。")
 }
 
 func statusReportAndGetAllStatus(node string, num string) []SeqNum {
@@ -108,8 +107,7 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 		}
 		configMap, err := cmApi.Get(ConfigMapName, metav1.GetOptions{})
 		if err != nil {
-			log.Println("waiting pod killed  by k8s ... ")
-			time.Sleep(time.Hour)
+			panic("can't read configmap from k8s")
 		}
 
 		if v, ok := configMap.Data[node]; !ok || v != num {
@@ -134,7 +132,7 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 		}
 		count++
 		if count > 49 {
-			os.Exit(1)
+			panic("can't start after 50 times retry")
 		}
 		time.Sleep(time.Second * 3)
 	}
@@ -142,33 +140,13 @@ func statusReportAndGetAllStatus(node string, num string) []SeqNum {
 	return nil
 }
 
-func initToWait() {
+func task() {
 
 	//  检查是否存在 grastate文件
 	// 不存在 .检查本pod是不是id 为0，直接启动，不是的话 检查上一个node节点是否活跃，否则等待。直到上一个节点活跃
-	file, err := os.Open(GrastatePath)
-	if os.IsNotExist(err) {
-		log.Println("文件不存在,按照顺序启动。。。")
-		if isFirst() {
-			signal <- 0
-			return
-		} else {
-			count := 0
-			for {
-				count++
-				log.Println("已重试", count, "次")
-				if preNodeReady(getPodNum() - 1) {
-					signal <- 0
-					return
-				}
-				time.Sleep(time.Second * 5)
-			}
-		}
+	if checkFileExits() {
+		return
 	}
-	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
 
 	// 存在
 	// 判断集群是否存在  存在集群，直接启动本机
@@ -178,9 +156,11 @@ func initToWait() {
 	}
 
 	// 获取所有seqnum，确保所有节点都至少通信过一次，检查是否所有的都是一样的seqnum，
-
 	seqNums := statusReportAndGetAllStatus(strconv.Itoa(getPodNum()), strconv.Itoa(getNum()))
+	startIfReady(seqNums)
+}
 
+func startIfReady(seqNums []SeqNum) {
 	// 一样，按照顺序启动
 	if isAllSeqNoEqual(seqNums) {
 		if isFirst() {
@@ -188,6 +168,7 @@ func initToWait() {
 			return
 		} else {
 			for {
+
 				if preNodeReady(getPodNum() - 1) {
 					signal <- 0
 					return
@@ -223,9 +204,39 @@ func initToWait() {
 	}
 }
 
+func checkFileExits() bool {
+	file, err := os.Open(GrastatePath)
+
+	if os.IsNotExist(err) {
+		log.Println("文件不存在,按照顺序启动。。。")
+		if isFirst() {
+			signal <- 0
+			return true
+		} else {
+			count := 0
+			for {
+				count++
+				log.Println("已重试", count, "次")
+				if preNodeReady(getPodNum() - 1) {
+					signal <- 0
+					return true
+				}
+				time.Sleep(time.Second * 5)
+			}
+		}
+	}
+
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	return false
+}
+
 func checkClusterExits() bool {
 
 	for i := 0; i < 3; i++ {
+		time.Sleep(5 * time.Second)
 		if isOpen(ClusterAddress, MysqlPort) {
 			signal <- 0
 			return true
@@ -269,20 +280,16 @@ type SeqNum struct {
 func preNodeReady(pre int) bool {
 
 	host := getPodPrefix() + "-" + strconv.Itoa(pre) + "." + MariadbGaleraClusterAddress
-	//_, err := net.LookupHost(host)
-	//if err != nil {
-	//	_, _ = fmt.Fprintf(os.Stderr, "Err: %s", err.Error())
-	//	return false
-	//}
+
 	return isOpen(host, MysqlPort)
 }
 
 func isOpen(host string, port string) bool {
 	url := net.JoinHostPort(host, port)
 	log.Println("尝试连接地址：", url)
-	conn, err := net.DialTimeout("tcp", url, 2*time.Second)
+	conn, err := net.DialTimeout("tcp", url, 10*time.Second)
 	if err != nil {
-		log.Printf("链接失败: %s:%s\n", host, port)
+		log.Printf("链接失败: %s:%s,err:%v\n", host, port, err)
 		return false
 	}
 	defer conn.Close()
@@ -300,12 +307,6 @@ func isFirst() bool {
 		return true
 	}
 	return false
-}
-
-type Resp struct {
-	Msg  string `json:"msg"`
-	Data int    `json:"data"`
-	Code int    `json:"code"`
 }
 
 func getPodPrefix() (name string) {
